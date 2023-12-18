@@ -12,12 +12,15 @@ int get_source_type(){
     return opt;
 }
 
-/* Handler for the pad-added signal */
-static void pad_added_handler (GstElement *src, GstPad *pad, gst_main_element *data);
-
 int main(int argc, char *argv[]){
     gst_main_element g_main;
     
+    g_main.playing = FALSE;
+    g_main.terminate = FALSE;
+    g_main.seek_enabled = FALSE;
+    g_main.seek_done = FALSE;
+    g_main.duration = GST_CLOCK_TIME_NONE;
+
     /* Initialize GStreamer */
     gst_init (&argc, &argv);
 
@@ -96,31 +99,45 @@ int main(int argc, char *argv[]){
 
     /* Wait until error or EOS */
     g_main.bus = gst_element_get_bus (g_main.pipeline);
-    g_main.msg = gst_bus_timed_pop_filtered (g_main.bus, GST_CLOCK_TIME_NONE,
-     (GstMessageType) (GST_MESSAGE_ERROR | GST_MESSAGE_EOS));
-    /* See next tutorial for proper error message handling/parsing */
-    if(g_main.msg != NULL){
-        GError *err;
-        gchar *debug_info;
-        switch(GST_MESSAGE_TYPE (g_main.msg)) {
-            case GST_MESSAGE_ERROR:
-            gst_message_parse_error(g_main.msg, &err, &debug_info);
-            
-            g_printerr ("GURU: An error occurred! src=%s, err=%s",
-                                GST_OBJECT_NAME(g_main.msg->src), err->message);
-            g_printerr("GURU: Debug info: %s", 
-                        debug_info ? debug_info:"none");
-            break;
-            case GST_MESSAGE_EOS:
-                g_print("GURU: Reached end of stream");
-            break;
-            default:
-                g_error("GURU: unknown error");
-            break;
+    do{
+        g_main.msg = gst_bus_timed_pop_filtered (g_main.bus, 100 * GST_MSECOND,
+         (GstMessageType)(GST_MESSAGE_STATE_CHANGED | GST_MESSAGE_ERROR | GST_MESSAGE_EOS | GST_MESSAGE_DURATION));
+        /* See next tutorial for proper error message handling/parsing */
+        if(g_main.msg != NULL){
+            handle_message (&g_main, g_main.msg);
+        }else {
+          /* We got no message, this means the timeout expired */
+          if (g_main.playing) {
+            gint64 current = -1;
+
+            /* Query the current position of the stream */
+            if (!gst_element_query_position (g_main.pipeline, GST_FORMAT_TIME, &current)) {
+              g_printerr ("Could not query current position.\n");
+            }
+
+            /* If we didn't know it yet, query the stream duration */
+            if (!GST_CLOCK_TIME_IS_VALID (g_main.duration)) {
+              if (!gst_element_query_duration (g_main.pipeline, GST_FORMAT_TIME, &g_main.duration)) {
+                g_printerr ("Could not query current duration.\n");
+              }
+            }
+
+            /* Print current position and total duration */
+            g_print ("Position %" GST_TIME_FORMAT " / %" GST_TIME_FORMAT "\r",
+                GST_TIME_ARGS (current), GST_TIME_ARGS (g_main.duration));
+
+            /* If seeking is enabled, we have not done it yet, and the time is right, seek */
+            if (g_main.seek_enabled && !g_main.seek_done && current > 5 * GST_SECOND) {
+              g_print ("\nReached 10s, performing seek...\n");
+              gst_element_seek_simple (g_main.pipeline, GST_FORMAT_TIME,
+                  (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT), 15 * GST_SECOND);
+              g_main.seek_done = TRUE;
+            }
+          }
         }
-    }
+    }while (!g_main.terminate);
     /* Free resources */
-    gst_message_unref (g_main.msg);
+
     gst_object_unref (g_main.bus);
     gst_element_set_state (g_main.pipeline, GST_STATE_NULL);
     gst_object_unref (g_main.pipeline);
@@ -187,3 +204,64 @@ exit:
     gst_caps_unref (new_pad_caps);
 
 }
+
+static void handle_message (gst_main_element *data, GstMessage *msg) {
+  GError *err;
+  gchar *debug_info;
+
+  switch (GST_MESSAGE_TYPE (msg)) {
+    case GST_MESSAGE_ERROR:
+      gst_message_parse_error (msg, &err, &debug_info);
+      g_printerr ("Error received from element %s: %s\n", GST_OBJECT_NAME (msg->src), err->message);
+      g_printerr ("Debugging information: %s\n", debug_info ? debug_info : "none");
+      g_clear_error (&err);
+      g_free (debug_info);
+      data->terminate = TRUE;
+      break;
+    case GST_MESSAGE_EOS:
+      g_print ("\nEnd-Of-Stream reached.\n");
+      data->terminate = TRUE;
+      break;
+    case GST_MESSAGE_DURATION:
+      /* The duration has changed, mark the current one as invalid */
+      data->duration = GST_CLOCK_TIME_NONE;
+      break;
+    case GST_MESSAGE_STATE_CHANGED: {
+      GstState old_state, new_state, pending_state;
+      gst_message_parse_state_changed (msg, &old_state, &new_state, &pending_state);
+      if (GST_MESSAGE_SRC (msg) == GST_OBJECT (data->pipeline)) {
+        g_print ("Pipeline state changed from %s to %s:\n",
+            gst_element_state_get_name (old_state), gst_element_state_get_name (new_state));
+
+        /* Remember whether we are in the PLAYING state or not */
+        data->playing = (new_state == GST_STATE_PLAYING);
+
+        if (data->playing) {
+          /* We just moved to PLAYING. Check if seeking is possible */
+          GstQuery *query;
+          gint64 start, end;
+          query = gst_query_new_seeking (GST_FORMAT_TIME);
+          if (gst_element_query (data->pipeline, query)) {
+            gst_query_parse_seeking (query, NULL, &data->seek_enabled, &start, &end);
+            if (data->seek_enabled) {
+              g_print ("Seeking is ENABLED from %" GST_TIME_FORMAT " to %" GST_TIME_FORMAT "\n",
+                  GST_TIME_ARGS (start), GST_TIME_ARGS (end));
+            } else {
+              g_print ("Seeking is DISABLED for this stream.\n");
+            }
+          }
+          else {
+            g_printerr ("Seeking query failed.");
+          }
+          gst_query_unref (query);
+        }
+      }
+    } break;
+    default:
+      /* We should not reach here */
+      g_printerr ("Unexpected message received.\n");
+      break;
+  }
+  gst_message_unref (msg);
+}
+

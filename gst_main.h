@@ -22,9 +22,18 @@ typedef struct _gst_main_element {
     GstBus *bus;
     GstMessage *msg;
     int c_ret;
+    
+    gboolean playing;      /* Are we in the PLAYING state? */
+    gboolean terminate;    /* Should we terminate execution? */
+    gboolean seek_enabled; /* Is seeking enabled for this media? */
+    gboolean seek_done;    /* Have we performed the seek already? */
+    gint64 duration;       /* How long does this media last, in nanoseconds */
 } gst_main_element;
 
 /* Handler for the pad-added signal */
-//static void pad_added_handler (GstElement *src, GstPad *pad, gst_main_element *data);
+static void pad_added_handler (GstElement *src, GstPad *pad, gst_main_element *data);
+
+/* Forward definition of the message processing function */
+static void handle_message (gst_main_element *data, GstMessage *msg);
 
 #endif
